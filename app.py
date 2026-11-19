@@ -1,6 +1,8 @@
 import streamlit as st
 import uuid
 import json
+import copy
+import traceback
 from datetime import datetime
 import re
 from urllib.parse import quote
@@ -10,7 +12,7 @@ import folium
 from streamlit_folium import st_folium
 
 # ==========================================
-# 0. 全局系统配置与紧凑样式注入
+# 0. 全局系统配置与样式注入
 # ==========================================
 try:
     API_KEY = st.secrets["API_KEY"]
@@ -60,13 +62,14 @@ st.markdown("""
         margin: 2px 0 10px 12px;
         font-weight: 500;
     }
-    .logistics-box {
-        background-color: rgba(128, 128, 128, 0.05);
-        border: 1px solid rgba(128, 128, 128, 0.2);
-        border-radius: 8px;
-        padding: 14px 16px;
-        margin-top: 8px;
-        margin-bottom: 12px;
+    .error-banner {
+        background-color: rgba(239, 68, 68, 0.1);
+        border: 1px solid rgba(239, 68, 68, 0.35);
+        color: #dc2626;
+        border-radius: 6px;
+        padding: 8px 14px;
+        font-size: 0.92rem;
+        font-weight: 500;
     }
     .ref-section {
         margin-top: 2rem;
@@ -84,6 +87,19 @@ st.markdown("""
         text-decoration: underline;
         color: #0096c7;
     }
+    /* 开发者隐形排错按钮样式 */
+    div[data-testid="stElementContainer"]:has(.dev-trigger-marker) + div[data-testid="stElementContainer"] button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: rgba(128, 128, 128, 0.15) !important;
+        padding: 0 4px !important;
+        min-height: 36px !important;
+    }
+    div[data-testid="stElementContainer"]:has(.dev-trigger-marker) + div[data-testid="stElementContainer"] button:hover {
+        color: rgba(128, 128, 128, 0.7) !important;
+        background: rgba(128, 128, 128, 0.08) !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -96,7 +112,6 @@ BLOCK_KEYWORDS = [
 ]
 
 def parse_days_from_date_str(date_str):
-    """解析具体日期范围并返回天数；模糊时间或空值返回 None"""
     text = date_str.strip()
     if not text:
         return None
@@ -216,7 +231,6 @@ def _filter_results(results):
 
 def fetch_social_guides(destination, user_input, days=3, travel_date="", search_events=True):
     if not TAVILY_API_KEY:
-        st.warning("未读取到 TAVILY_API_KEY，本次未使用联网检索。")
         return "无实时检索数据", "无限时活动数据", []
 
     guide_q, event_q, max_k = plan_search_strategy(destination, user_input, days, travel_date)
@@ -232,8 +246,7 @@ def fetch_social_guides(destination, user_input, days=3, travel_date="", search_
             title = r.get("title", "未命名攻略")
             guide_context += f"- 标题：{title}\n  摘要：{r.get('content', '')}\n\n"
             sources.append({"title": title, "url": r.get("url", "")})
-    except Exception as e:
-        st.error(f"主攻略检索失败：{e}")
+    except Exception:
         guide_context = "主攻略实时检索失败"
 
     if search_events:
@@ -250,7 +263,8 @@ def fetch_social_guides(destination, user_input, days=3, travel_date="", search_
         except Exception:
             event_context = ""
 
-    st.toast(f"已检索「{guide_q}」，筛选出 {len(sources)} 篇有效参考")
+    if sources:
+        st.toast(f"已检索「{guide_q}」，筛选出 {len(sources)} 篇有效参考")
     return guide_context, event_context, sources
 
 def chat_with_agent(messages, destination="目的地", days=3, travel_date="", search_events=True):
@@ -319,11 +333,9 @@ def chat_with_agent(messages, destination="目的地", days=3, travel_date="", s
             "3. 每个景点必须填满 description、highlights、food_tips、tips 四个字段！\n"
             "4. 若无限时活动，optional_events 必须为 []。"
         )
+        if days > 7:
+            fortified_input += "\n5. 本次行程天数较多，请将每个景点的各字段控制在1句精炼干货以内，确保完整输出全部天数的合法 JSON，切勿截断。"
         api_messages[-1] = {"role": "user", "content": fortified_input}
-
-    # 针对长途行程（超过7天）增加精简提示，防止超出 8192 tokens 上限
-    if days > 7 and api_messages and api_messages[-1]["role"] == "user":
-        api_messages[-1]["content"] += "\n5. 本次行程天数较多，请将每个景点的各字段控制在1句精炼干货以内，确保完整输出全部天数的合法 JSON，切勿截断。"
 
     final_messages = [system_message] + api_messages
 
@@ -336,21 +348,16 @@ def chat_with_agent(messages, destination="目的地", days=3, travel_date="", s
     )
 
     if response.choices[0].finish_reason == "length":
-        st.warning("行程天数过多，输出已达到单次长度上限，建议缩短天数或分段规划。")
-
-    return response.choices[0].message.content, sources
+        raise ValueError("模型输出超过 max_tokens=8192 长度限制，JSON 被截断。")
 
     return response.choices[0].message.content, sources
 
 # ==========================================
-# 1.5 版本级配套推荐生成器（按需调用并缓存）
+# 1.5 版本级配套推荐生成器
 # ==========================================
 def extract_itinerary_brief(parsed_data):
-    """提取当前版本的景点列表与首尾时间，供配套推荐精准定制"""
     days_list = parsed_data.get("days", [])
-    spots = []
-    hotels = []
-    day_briefs = []
+    spots, hotels, day_briefs = [], [], []
     for d in days_list:
         d_spots = []
         for act in d.get("activities", []):
@@ -381,7 +388,7 @@ def generate_logistics_module(module_type, parsed_data, session_info, custom_ori
             "    {\n"
             '      "name": "片区与推荐酒店示例（如：静安寺商圈 · 全季/亚朵）",\n'
             '      "price_range": "参考价位（如：350-550元/晚）",\n'
-            '      "pros": "结合本版行程说明选址优势（如：去哪几个景点地铁直达）",\n'
+            '      "pros": "结合本版行程说明选址优势",\n'
             '      "cons": "潜在缺点或注意事项"\n'
             "    }\n"
             "  ]\n"
@@ -411,7 +418,7 @@ def generate_logistics_module(module_type, parsed_data, session_info, custom_ori
             "要求（严禁使用 Emoji，输出简洁清晰的 Markdown）：\n"
             "1. 对比高铁/动车与航班的耗时、大致票价区间与优劣，给出明确推荐。\n"
             "2. 结合本版 Day 1 和最后一天的行程节奏，建议具体的去程抵达时段和返程出发时段（以及推荐选哪个车站/机场更顺路）。\n"
-            "3. 给出 1-2 条购票省钱或防踩坑建议（如提前几天放票、夜间航班接驳等）。"
+            "3. 给出 1-2 条购票省钱或防踩坑建议。"
         )
         res = client.chat.completions.create(
             model=MODEL_NAME,
@@ -469,12 +476,20 @@ def generate_logistics_module(module_type, parsed_data, session_info, custom_ori
         return res.choices[0].message.content
 
 # ==========================================
-# 2. 状态初始化与多会话/多版本管理
+# 2. 状态初始化、错误提示与撤回机制
 # ==========================================
 if "sessions" not in st.session_state:
     st.session_state.sessions = {}
 if "current_session_id" not in st.session_state:
     st.session_state.current_session_id = None
+if "last_error" not in st.session_state:
+    st.session_state.last_error = None
+if "show_error_detail" not in st.session_state:
+    st.session_state.show_error_detail = False
+if "confirm_del_session" not in st.session_state:
+    st.session_state.confirm_del_session = None
+if "confirm_del_ver" not in st.session_state:
+    st.session_state.confirm_del_ver = None
 
 def create_new_session():
     new_id = str(uuid.uuid4())
@@ -489,6 +504,38 @@ def create_new_session():
         "active_version_id": None
     }
     st.session_state.current_session_id = new_id
+    st.session_state.last_error = None
+    st.session_state.show_error_detail = False
+
+def record_error(err_detail):
+    st.session_state.last_error = err_detail
+    st.session_state.show_error_detail = False
+
+def render_error_banner():
+    """统一友好报错栏 + 撤回按钮 + 开发者隐形排错按钮"""
+    if not st.session_state.get("last_error"):
+        return
+
+    c_msg, c_dev, c_undo = st.columns([9, 0.6, 2.2])
+    with c_msg:
+        st.markdown(
+            '<div class="error-banner">出现错误，请稍后重试</div>',
+            unsafe_allow_html=True
+        )
+    with c_dev:
+        # 开发者隐形按钮（悬停时微微可见）
+        st.markdown('<span class="dev-trigger-marker"></span>', unsafe_allow_html=True)
+        if st.button("·", key="dev_error_toggle", help="开发者排错信息"):
+            st.session_state.show_error_detail = not st.session_state.show_error_detail
+            st.rerun()
+    with c_undo:
+        if st.button("撤回到上一步", key="btn_undo_error", use_container_width=True):
+            st.session_state.last_error = None
+            st.session_state.show_error_detail = False
+            st.rerun()
+
+    if st.session_state.show_error_detail:
+        st.code(st.session_state.last_error, language="python")
 
 if not st.session_state.sessions:
     create_new_session()
@@ -496,7 +543,7 @@ if not st.session_state.sessions:
 current_session = st.session_state.sessions[st.session_state.current_session_id]
 
 # ==========================================
-# 3. 侧边栏：行程会话管理
+# 3. 侧边栏：行程会话管理（含删除二次确认）
 # ==========================================
 with st.sidebar:
     st.header("行程管理")
@@ -512,19 +559,35 @@ with st.sidebar:
             btn_label = f"▸ {session_data['title']}" if is_active else session_data['title']
             if st.button(btn_label, key=f"btn_{session_id}", use_container_width=True):
                 st.session_state.current_session_id = session_id
+                st.session_state.confirm_del_session = None
+                st.session_state.last_error = None
                 st.rerun()
         with col2:
-            if st.button("×", key=f"del_{session_id}"):
-                del st.session_state.sessions[session_id]
-                if st.session_state.current_session_id == session_id:
-                    if st.session_state.sessions:
-                        st.session_state.current_session_id = list(st.session_state.sessions.keys())[0]
-                    else:
-                        create_new_session()
+            if st.button("×", key=f"del_{session_id}", help="删除行程"):
+                st.session_state.confirm_del_session = session_id
                 st.rerun()
 
+        # 删除行程二次确认
+        if st.session_state.confirm_del_session == session_id:
+            st.caption("确认删除该行程？")
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                if st.button("确认删除", key=f"ok_del_s_{session_id}", type="primary", use_container_width=True):
+                    del st.session_state.sessions[session_id]
+                    st.session_state.confirm_del_session = None
+                    if st.session_state.current_session_id == session_id:
+                        if st.session_state.sessions:
+                            st.session_state.current_session_id = list(st.session_state.sessions.keys())[0]
+                        else:
+                            create_new_session()
+                    st.rerun()
+            with cc2:
+                if st.button("取消", key=f"no_del_s_{session_id}", use_container_width=True):
+                    st.session_state.confirm_del_session = None
+                    st.rerun()
+
 # ==========================================
-# 4. 核心视图：单版本分栏渲染 + 版本专属订票/出行配套按钮
+# 4. 核心视图：单版本分栏渲染 + 版本专属配套按钮
 # ==========================================
 def render_trip_workspace(version_obj):
     plan_json_str = version_obj["json_str"]
@@ -543,18 +606,16 @@ def render_trip_workspace(version_obj):
 
     try:
         data = json.loads(cleaned_str)
-    except json.JSONDecodeError:
-        st.error("该版本 JSON 解析失败，原始输出如下：")
-        st.code(plan_json_str, language="markdown")
+    except Exception:
+        record_error(f"JSON 解析失败：\n{traceback.format_exc()}\n\n原始输出：\n{plan_json_str}")
+        st.rerun()
         return None, None
 
     with st.expander(f"📌 本版需求与总览 · {version_obj['label']}", expanded=True):
         st.caption(f"需求指令：{version_obj['prompt']}")
         st.markdown(f"**行程总结**：{data.get('summary', '暂无总结')}")
 
-    # ------------------------------------------
     # 版本专属：订票与出行配套推荐按钮栏
-    # ------------------------------------------
     panel_key = f"active_panel_{ver_id}"
     if panel_key not in st.session_state:
         st.session_state[panel_key] = None
@@ -581,113 +642,111 @@ def render_trip_workspace(version_obj):
     active_panel = st.session_state[panel_key]
     if active_panel:
         with st.container(border=True):
-            # 1. 酒店推荐与换址重排
-            if active_panel == "hotel":
-                st.markdown("##### 酒店推荐与换址重排（基于本版行程）")
-                if "hotel" not in version_obj["logistics"]:
-                    with st.spinner("正在结合本版景点分布分析最佳住宿片区..."):
-                        version_obj["logistics"]["hotel"] = generate_logistics_module("hotel", data, current_session)
+            try:
+                if active_panel == "hotel":
+                    st.markdown("##### 酒店推荐与换址重排（基于本版行程）")
+                    if "hotel" not in version_obj["logistics"]:
+                        with st.spinner("正在结合本版景点分布分析最佳住宿片区..."):
+                            version_obj["logistics"]["hotel"] = generate_logistics_module("hotel", data, current_session)
 
-                hotels_data = version_obj["logistics"]["hotel"].get("hotels", [])
-                for h_idx, h in enumerate(hotels_data):
-                    hc1, hc2 = st.columns([4, 1.3])
-                    with hc1:
-                        st.markdown(f"**{h.get('name', '推荐酒店')}**（{h.get('price_range', '价位待定')}）")
-                        st.caption(f"优势：{h.get('pros', '')} ｜ 注意：{h.get('cons', '')}")
-                    with hc2:
-                        if st.button("改住这里并重排", key=f"switch_h_{ver_id}_{h_idx}", use_container_width=True):
-                            triggered_prompt = (
-                                f"请将住宿更换为【{h.get('name')}】，并围绕该酒店位置重新优化每天的出发/返回路线、顺路顺序与交通方式。"
-                            )
-                            triggered_label = f"换住·{h.get('name', '')[:6]}"
+                    hotels_data = version_obj["logistics"]["hotel"].get("hotels", [])
+                    for h_idx, h in enumerate(hotels_data):
+                        hc1, hc2 = st.columns([4, 1.3])
+                        with hc1:
+                            st.markdown(f"**{h.get('name', '推荐酒店')}**（{h.get('price_range', '价位待定')}）")
+                            st.caption(f"优势：{h.get('pros', '')} ｜ 注意：{h.get('cons', '')}")
+                        with hc2:
+                            if st.button("改住这里并重排", key=f"switch_h_{ver_id}_{h_idx}", use_container_width=True):
+                                triggered_prompt = (
+                                    f"请将住宿更换为【{h.get('name')}】，并围绕该酒店位置重新优化每天的出发/返回路线、顺路顺序与交通方式。"
+                                )
+                                triggered_label = f"换住·{h.get('name', '')[:6]}"
 
-                st.markdown("---")
-                cc1, cc2 = st.columns([4, 1.3])
-                with cc1:
-                    custom_hotel = st.text_input(
-                        "自定义酒店",
-                        placeholder="已有心仪酒店？输入名称或商圈（如：外滩华尔道夫 / 虹桥火车站附近）",
-                        label_visibility="collapsed",
-                        key=f"custom_hotel_{ver_id}"
-                    )
-                with cc2:
-                    if st.button("按此位置重排", key=f"apply_custom_h_{ver_id}", type="primary", use_container_width=True):
-                        if custom_hotel.strip():
-                            triggered_prompt = (
-                                f"请将住宿更换为【{custom_hotel.strip()}】，并围绕该酒店位置重新优化每天的出发/返回路线、顺路顺序与交通方式。"
-                            )
-                            triggered_label = f"换住·{custom_hotel.strip()[:6]}"
-                        else:
-                            st.warning("请先输入酒店名称或区域。")
-
-            # 2. 跨城交通推荐
-            elif active_panel == "intercity":
-                st.markdown("##### 跨城往返交通推荐")
-                dest = current_session.get("destination", "上海")
-                origin = current_session.get("origin", "").strip()
-
-                if not origin:
-                    ic1, ic2 = st.columns([3, 1])
-                    with ic1:
-                        input_origin = st.text_input(
-                            "补充出发地",
-                            placeholder="初始未填写出发地，请输入（如：北京、杭州）",
+                    st.markdown("---")
+                    cc1, cc2 = st.columns([4, 1.3])
+                    with cc1:
+                        custom_hotel = st.text_input(
+                            "自定义酒店",
+                            placeholder="已有心仪酒店？输入名称或商圈（如：外滩华尔道夫 / 虹桥火车站附近）",
                             label_visibility="collapsed",
-                            key=f"add_origin_{ver_id}"
+                            key=f"custom_hotel_{ver_id}"
                         )
-                    with ic2:
-                        if st.button("查询往返方案", key=f"query_ic_{ver_id}", type="primary", use_container_width=True):
-                            if input_origin.strip():
-                                current_session["origin"] = input_origin.strip()
-                                version_obj["logistics"].pop("intercity", None)
-                                st.rerun()
-                else:
-                    if "intercity" not in version_obj["logistics"]:
-                        with st.spinner(f"正在检索 {origin} 往返 {dest} 的高铁与航班信息..."):
-                            version_obj["logistics"]["intercity"] = generate_logistics_module("intercity", data, current_session)
+                    with cc2:
+                        if st.button("按此位置重排", key=f"apply_custom_h_{ver_id}", type="primary", use_container_width=True):
+                            if custom_hotel.strip():
+                                triggered_prompt = (
+                                    f"请将住宿更换为【{custom_hotel.strip()}】，并围绕该酒店位置重新优化每天的出发/返回路线、顺路顺序与交通方式。"
+                                )
+                                triggered_label = f"换住·{custom_hotel.strip()[:6]}"
+                            else:
+                                st.warning("请先输入酒店名称或区域。")
 
-                    st.markdown(version_obj["logistics"]["intercity"])
+                elif active_panel == "intercity":
+                    st.markdown("##### 跨城往返交通推荐")
+                    dest = current_session.get("destination", "上海")
+                    origin = current_session.get("origin", "").strip()
 
-                    # 提供实时查票直达链接
-                    ctrip_flight = f"https://flights.ctrip.com/online/list/oneway-{quote(origin)}-{quote(dest)}"
-                    ctrip_train = f"https://trains.ctrip.com/webapp/train/list?ticketType=0&dStation={quote(origin)}&aStation={quote(dest)}"
-                    st.markdown(
-                        f"**实时余票与价格直达**："
-                        f"[携程机票查询]({ctrip_flight}) ｜ "
-                        f"[携程火车票查询]({ctrip_train}) ｜ "
-                        f"[铁路 12306 官网](https://www.12306.cn/index/)"
-                    )
+                    if not origin:
+                        ic1, ic2 = st.columns([3, 1])
+                        with ic1:
+                            input_origin = st.text_input(
+                                "补充出发地",
+                                placeholder="初始未填写出发地，请输入（如：北京、杭州）",
+                                label_visibility="collapsed",
+                                key=f"add_origin_{ver_id}"
+                            )
+                        with ic2:
+                            if st.button("查询往返方案", key=f"query_ic_{ver_id}", type="primary", use_container_width=True):
+                                if input_origin.strip():
+                                    current_session["origin"] = input_origin.strip()
+                                    version_obj["logistics"].pop("intercity", None)
+                                    st.rerun()
+                    else:
+                        if "intercity" not in version_obj["logistics"]:
+                            with st.spinner(f"正在检索 {origin} 往返 {dest} 的高铁与航班信息..."):
+                                version_obj["logistics"]["intercity"] = generate_logistics_module("intercity", data, current_session)
 
-            # 3. 景点预约清单
-            elif active_panel == "reservations":
-                st.markdown("##### 本版景点预约与购票清单")
-                if "reservations" not in version_obj["logistics"]:
-                    with st.spinner("正在核对本版景点的预约渠道、放票时间与优惠政策..."):
-                        version_obj["logistics"]["reservations"] = generate_logistics_module("reservations", data, current_session)
+                        st.markdown(version_obj["logistics"]["intercity"])
 
-                items = version_obj["logistics"]["reservations"].get("items", [])
-                if items:
-                    for it in items:
+                        ctrip_flight = f"https://flights.ctrip.com/online/list/oneway-{quote(origin)}-{quote(dest)}"
+                        ctrip_train = f"https://trains.ctrip.com/webapp/train/list?ticketType=0&dStation={quote(origin)}&aStation={quote(dest)}"
                         st.markdown(
-                            f"**{it.get('spot', '')}** — 渠道：{it.get('channel', '')}  \n"
-                            f"- 预约时间：{it.get('timing', '')}  \n"
-                            f"- 费用与优惠：{it.get('cost_discount', '')}  \n"
-                            f"- 注意事项：{it.get('notes', '')}"
+                            f"**实时余票与价格直达**："
+                            f"[携程机票查询]({ctrip_flight}) ｜ "
+                            f"[携程火车票查询]({ctrip_train}) ｜ "
+                            f"[铁路 12306 官网](https://www.12306.cn/index/)"
                         )
-                else:
-                    st.info("本版行程中的景点大多无需提前预约，随到随逛即可。")
 
-            # 4. 当地交通指南
-            elif active_panel == "local_transit":
-                st.markdown("##### 当地交通与购票注意事项")
-                if "local_transit" not in version_obj["logistics"]:
-                    with st.spinner("正在整理当地乘车与交通卡建议..."):
-                        version_obj["logistics"]["local_transit"] = generate_logistics_module("local_transit", data, current_session)
-                st.markdown(version_obj["logistics"]["local_transit"])
+                elif active_panel == "reservations":
+                    st.markdown("##### 本版景点预约与购票清单")
+                    if "reservations" not in version_obj["logistics"]:
+                        with st.spinner("正在核对本版景点的预约渠道、放票时间与优惠政策..."):
+                            version_obj["logistics"]["reservations"] = generate_logistics_module("reservations", data, current_session)
 
-    # ------------------------------------------
+                    items = version_obj["logistics"]["reservations"].get("items", [])
+                    if items:
+                        for it in items:
+                            st.markdown(
+                                f"**{it.get('spot', '')}** — 渠道：{it.get('channel', '')}  \n"
+                                f"- 预约时间：{it.get('timing', '')}  \n"
+                                f"- 费用与优惠：{it.get('cost_discount', '')}  \n"
+                                f"- 注意事项：{it.get('notes', '')}"
+                            )
+                    else:
+                        st.info("本版行程中的景点大多无需提前预约，随到随逛即可。")
+
+                elif active_panel == "local_transit":
+                    st.markdown("##### 当地交通与购票注意事项")
+                    if "local_transit" not in version_obj["logistics"]:
+                        with st.spinner("正在整理当地乘车与交通卡建议..."):
+                            version_obj["logistics"]["local_transit"] = generate_logistics_module("local_transit", data, current_session)
+                    st.markdown(version_obj["logistics"]["local_transit"])
+            except Exception:
+                st.session_state[panel_key] = None
+                record_error(traceback.format_exc())
+                st.rerun()
+
     # 日程切换与左右分栏视图
-    # ------------------------------------------
     days_data = data.get("days", [])
     if days_data:
         tab_titles = [f"Day {day['day']} · {day.get('title', '')}" for day in days_data]
@@ -771,6 +830,7 @@ def render_trip_workspace(version_obj):
                     scroll_wheel_zoom=False
                 )
 
+                # 默认使用高德中文底图，确保国内网络直连可用
                 folium.TileLayer(
                     tiles="https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
                     attr="高德地图",
@@ -889,38 +949,59 @@ def render_trip_workspace(version_obj):
     return triggered_prompt, triggered_label
 
 # ==========================================
-# 5. 辅助函数：提交新版本生成
+# 5. 辅助函数：提交新版本生成（带状态快照与出错自动撤回）
 # ==========================================
 def run_new_version(user_input, label_override=None, search_events=False):
-    current_session["messages"].append({"role": "user", "content": user_input})
-    with st.spinner("正在检索实时攻略并生成新版本方案..."):
-        response, sources = chat_with_agent(
-            current_session["messages"],
-            destination=current_session.get("destination", "上海"),
-            days=current_session.get("days", 5),
-            travel_date=current_session.get("travel_date", ""),
-            search_events=search_events
-        )
-        current_session["messages"].append({"role": "assistant", "content": response})
+    sid = st.session_state.current_session_id
+    # 先保存操作前的完整快照，出错时自动撤回
+    snapshot = copy.deepcopy(st.session_state.sessions[sid])
+    st.session_state.last_error = None
+    st.session_state.show_error_detail = False
 
-        ver_num = len(current_session["versions"]) + 1
-        short_title = user_input[:8] + "..." if len(user_input) > 8 else user_input
-        new_ver_id = str(uuid.uuid4())
-        current_session["versions"].append({
-            "id": new_ver_id,
-            "label": label_override or f"V{ver_num} · {short_title}",
-            "prompt": user_input,
-            "json_str": response,
-            "sources": sources,
-            "logistics": {}
-        })
-        current_session["active_version_id"] = new_ver_id
+    try:
+        current_session["messages"].append({"role": "user", "content": user_input})
+        with st.spinner("正在检索实时攻略并生成新版本方案..."):
+            response, sources = chat_with_agent(
+                current_session["messages"],
+                destination=current_session.get("destination", "上海"),
+                days=current_session.get("days", 5),
+                travel_date=current_session.get("travel_date", ""),
+                search_events=search_events
+            )
+
+            # 提前校验 JSON 合法性，防止把损坏的版本写入状态
+            cleaned_check = response.strip()
+            if cleaned_check.startswith("```"):
+                cleaned_check = re.sub(r"^```(?:json)?", "", cleaned_check)
+                cleaned_check = re.sub(r"```$", "", cleaned_check).strip()
+            json.loads(cleaned_check)
+
+            current_session["messages"].append({"role": "assistant", "content": response})
+
+            ver_num = len(current_session["versions"]) + 1
+            short_title = user_input[:8] + "..." if len(user_input) > 8 else user_input
+            new_ver_id = str(uuid.uuid4())
+            current_session["versions"].append({
+                "id": new_ver_id,
+                "label": label_override or f"V{ver_num} · {short_title}",
+                "prompt": user_input,
+                "json_str": response,
+                "sources": sources,
+                "logistics": {}
+            })
+            current_session["active_version_id"] = new_ver_id
+    except Exception:
+        # 出错自动回滚到操作前的状态
+        st.session_state.sessions[sid] = snapshot
+        record_error(traceback.format_exc())
+
     st.rerun()
 
 # ==========================================
 # 6. 主界面：初始表单 / 版本工作台
 # ==========================================
 st.title("定制化行程规划工作台")
+render_error_banner()
 
 if not current_session["versions"]:
     st.markdown("填写基础信息，系统将结合实时网络攻略为您生成第一版结构化行程。")
@@ -990,17 +1071,31 @@ else:
             with c1:
                 if st.button(ver["label"], key=f"sel_ver_{ver['id']}", type=btn_type, use_container_width=True):
                     current_session["active_version_id"] = ver["id"]
+                    st.session_state.confirm_del_ver = None
                     st.rerun()
             with c2:
                 if st.button("×", key=f"del_ver_{ver['id']}", help="删除此版本"):
-                    current_session["versions"] = [v for v in versions if v["id"] != ver["id"]]
-                    if current_session["active_version_id"] == ver["id"]:
-                        if current_session["versions"]:
-                            current_session["active_version_id"] = current_session["versions"][-1]["id"]
-                        else:
-                            current_session["active_version_id"] = None
-                            current_session["messages"] = []
+                    st.session_state.confirm_del_ver = ver["id"]
                     st.rerun()
+
+            # 删除版本二次确认
+            if st.session_state.confirm_del_ver == ver["id"]:
+                vc1, vc2 = st.columns(2)
+                with vc1:
+                    if st.button("确认删", key=f"ok_del_v_{ver['id']}", type="primary", use_container_width=True):
+                        current_session["versions"] = [v for v in versions if v["id"] != ver["id"]]
+                        st.session_state.confirm_del_ver = None
+                        if current_session["active_version_id"] == ver["id"]:
+                            if current_session["versions"]:
+                                current_session["active_version_id"] = current_session["versions"][-1]["id"]
+                            else:
+                                current_session["active_version_id"] = None
+                                current_session["messages"] = []
+                        st.rerun()
+                with vc2:
+                    if st.button("取消", key=f"no_del_v_{ver['id']}", use_container_width=True):
+                        st.session_state.confirm_del_ver = None
+                        st.rerun()
 
     st.markdown("---")
 
