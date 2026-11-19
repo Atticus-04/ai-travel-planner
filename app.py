@@ -771,14 +771,14 @@ def render_trip_workspace(version_obj):
                     scroll_wheel_zoom=False
                 )
 
-                folium.TileLayer(tiles="OpenStreetMap", name="标准地图 (最稳定)", show=True).add_to(m)
-                folium.TileLayer(tiles="CartoDB positron", name="极简浅色 (推荐)", show=False).add_to(m)
                 folium.TileLayer(
-                    tiles="[https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=](https://webrd01.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x=){x}&y={y}&z={z}",
+                    tiles="https://webrd02.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
                     attr="高德地图",
-                    name="高德中文地图",
-                    show=False
+                    name="高德中文地图 (国内直连)",
+                    show=True
                 ).add_to(m)
+                folium.TileLayer(tiles="OpenStreetMap", name="OpenStreetMap (需海外网络)", show=False).add_to(m)
+                folium.TileLayer(tiles="CartoDB positron", name="极简浅色 (需海外网络)", show=False).add_to(m)
 
                 route_coords = []
                 for idx, point in enumerate(map_data):
